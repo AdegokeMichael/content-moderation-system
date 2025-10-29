@@ -1,68 +1,100 @@
-# Multi-stage Dockerfile for Content Moderation API
-# Optimized for production use with ML models
+# Production Dockerfile for Content Moderation API
+# Lazy-download variant: models are loaded at runtime into /app/.cache/huggingface (mount as volume)
 
-# Stage 1: Base image with Python and system dependencies
-FROM python:3.11-slim as base
+# ============================================
+# Stage 1: Builder - Install dependencies
+# ============================================
+FROM python:3.11-slim as builder
 
-# Set environment variables
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    DEBIAN_FRONTEND=noninteractive \
+    APP_HOME=/app \
+    HF_HOME=/app/.cache/huggingface \
+    TRANSFORMERS_CACHE=/app/.cache/huggingface \
+    HF_HUB_CACHE=/app/.cache/huggingface \
+    TORCH_HOME=/app/.cache/torch
 
-# Install system dependencies
+# Install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
     gcc \
     g++ \
-    curl \
     libpq-dev \
+    curl \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Create non-root user
-RUN useradd -m -u 1000 -s /bin/bash moderator && \
-    mkdir -p /app /models && \
-    chown -R moderator:moderator /app /models
+# Create virtual environment
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
 
-WORKDIR /app
-
-# Stage 2: Dependencies installation
-FROM base as dependencies
-
-# Copy requirements file
-COPY requirements.txt .
-
-# Install Python dependencies
+# Copy requirements and install
+COPY requirements.txt /tmp/requirements.txt
 RUN pip install --upgrade pip setuptools wheel && \
-    pip install -r requirements.txt && \
-    pip cache purge
+    pip install --no-cache-dir -r /tmp/requirements.txt
 
-# Download ML models during build (cache layer)
-RUN python -c "from transformers import pipeline; \
-    pipeline('sentiment-analysis', model='distilbert-base-uncased-finetuned-sst-2-english'); \
-    print('Models downloaded successfully')"
+# NOTE: Removed build-time model download. We will lazy-download models at runtime into a mounted volume.
 
-# Stage 3: Final production image
-FROM base as production
+# ============================================
+# Stage 2: Production - Runtime image
+# ============================================
+FROM python:3.11-slim as production
 
-# Copy installed packages from dependencies stage
-COPY --from=dependencies /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
-COPY --from=dependencies /usr/local/bin /usr/local/bin
-COPY --from=dependencies /root/.cache /root/.cache
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    DEBIAN_FRONTEND=noninteractive \
+    APP_HOME=/app \
+    HF_HOME=/app/.cache/huggingface \
+    TRANSFORMERS_CACHE=/app/.cache/huggingface \
+    HF_HUB_CACHE=/app/.cache/huggingface \
+    TORCH_HOME=/app/.cache/torch \
+    PATH="/opt/venv/bin:$PATH" \
+    HOME=/app
 
-# Copy application code
-COPY --chown=moderator:moderator main.py .
-COPY --chown=moderator:moderator ml_classifier.py .
-COPY --chown=moderator:moderator social_media.py .
+# Runtime dependencies (include common libs for numpy/torch)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 \
+    curl \
+    ca-certificates \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create app directory and cache directory
+RUN mkdir -p ${APP_HOME} /app/.cache/huggingface /app/logs
+
+# Create non-root user with /app as home directory
+RUN groupadd -r appuser && \
+    useradd -r -g appuser -u 1000 -d /app -m -s /sbin/nologin appuser
+
+# Copy virtual environment from builder
+COPY --from=builder /opt/venv /opt/venv
+
+# IMPORTANT: do NOT copy model cache from builder (lazy-download approach)
+# COPY --from=builder /app/.cache/huggingface /app/.cache/huggingface  <-- removed
+
+# Set permissions for venv, app and caches BEFORE switching user
+RUN chown -R appuser:appuser ${APP_HOME} /app/.cache /app/logs /opt/venv
+
+# Set working directory
+WORKDIR ${APP_HOME}
+
+# Copy application files (owned by appuser)
+COPY --chown=appuser:appuser main.py .
+COPY --chown=appuser:appuser ml_classifier.py .
+COPY --chown=appuser:appuser social_media.py .
 
 # Switch to non-root user
-USER moderator
+USER appuser
 
 # Expose port
 EXPOSE 8000
 
 # Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
-# Run the application
+# Start application
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
