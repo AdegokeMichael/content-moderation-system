@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Content Moderation API Service
 Main application entry point with webhook endpoints and business logic
@@ -14,11 +16,9 @@ import asyncpg
 import os
 from contextlib import asynccontextmanager
 
-# ML Model Service
-from ml_classifier import ContentClassifier
-
-# Social Media Integration
-from social_media import SocialMediaPoster
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from social_media import SocialMediaPoster
 
 # Configure structured logging
 logging.basicConfig(
@@ -84,10 +84,15 @@ async def lifespan(app: FastAPI):
     )
     logger.info("Database pool initialized")
     
+    from ml_classifier import ContentClassifier
+
     # Initialize ML classifier
     app.state.classifier = ContentClassifier()
     logger.info("ML classifier initialized")
     
+  
+    from social_media import SocialMediaPoster
+
     # Initialize social media poster
     app.state.social_poster = SocialMediaPoster(
         facebook_token=os.getenv("FACEBOOK_TOKEN"),
@@ -467,7 +472,7 @@ async def log_error(content_id: str, error: str, submission_data: Dict[str, Any]
 async def post_to_social_media(
     content_id: str,
     content: str,
-    social_poster: SocialMediaPoster
+    social_poster: 'SocialMediaPoster'
 ):
     """Post acceptable content to social media platforms"""
     try:
